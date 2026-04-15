@@ -1,41 +1,33 @@
-FROM ubuntu:24.04 AS builder
+FROM debian:bookworm-slim AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
-    make \
-    python3 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential make \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
-COPY . .
+WORKDIR /app
 
-RUN gcc -std=c11 -Wall -Wextra -pedantic -Isrc -o /usr/local/bin/sql_processor_bptree \
-    src/main.c \
-    src/lexer.c \
-    src/parser.c \
-    src/meta.c \
-    src/storage.c \
-    src/executor.c \
-    src/util.c \
-    src/bptree.c
+COPY Makefile ./
+COPY include ./include
+COPY src ./src
+COPY data ./data
+COPY sql ./sql
 
-FROM ubuntu:24.04
+RUN make
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-WORKDIR /workspace
+COPY --from=builder /app/mini_sql /app/mini_sql
+COPY --from=builder /app/mini_sql_tests /app/mini_sql_tests
+COPY --from=builder /app/mini_sql_benchmark /app/mini_sql_benchmark
+COPY --from=builder /app/mini_sql_seed /app/mini_sql_seed
+COPY --from=builder /app/data /app/data
+COPY --from=builder /app/sql /app/sql
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
-COPY --from=builder /usr/local/bin/sql_processor_bptree /usr/local/bin/sql_processor_bptree
-COPY . /workspace/
+RUN mkdir -p /app/logs
+RUN chmod +x /app/docker-entrypoint.sh
 
-ENTRYPOINT ["/usr/local/bin/sql_processor_bptree"]
-CMD ["--repl"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["./mini_sql", "--repl"]

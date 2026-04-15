@@ -1,664 +1,371 @@
-# SQLInsertSelect
+# mini_sql with B+ Tree Index
 
-파일 기반 미니 SQL 처리기입니다.  
-기존의 `lexer -> parser -> AST -> executor -> binary storage` 구조를 유지하면서, 현재 버전에서는 아래 기능을 지원합니다.
+기존 `mini_sql` SQL 처리기를 유지한 채, `id` 컬럼에 대한 디스크 persist B+ 트리 인덱스(`.idx`)를 붙인 과제 제출용 버전입니다.
 
-- `id` 자동 증가
-- 메모리 기반 B+ 트리 인덱스
-- `WHERE id = ?`, `>`, `>=`, `<`, `<=`, `BETWEEN` 인덱스 탐색
-- 그 외 조건의 선형 탐색
-- `BETWEEN` 지원
-- 대량 데이터 생성기
-- 쿼리 실행 시간 로그
+## 구현 범위
 
-## 1. 프로젝트 개요
+- SQL 파이프라인 유지
+  - `Tokenizer -> Parser -> Optimizer -> Executor`
+- 지원 SQL
+  - `INSERT INTO table VALUES (...)`
+  - `INSERT INTO table (col1, col2, ...) VALUES (...)`
+  - `SELECT * FROM table`
+  - `SELECT col1, col2 FROM table`
+  - `SELECT ... FROM table WHERE column <op> literal`
+- 지원 비교 연산자
+  - `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`
+- 인덱스 적용 대상
+  - `WHERE id <op> ?` 전체
+  - `id = ?`, `id != ?`, `id < ?`, `id <= ?`, `id > ?`, `id >= ?`
+- 선형 탐색 대상
+  - `WHERE email = ?` 같은 non-id 조건
 
-이 프로젝트는 SQL 문자열을 바로 실행하지 않고, 아래 순서로 처리합니다.
+## 핵심 동작
 
-```text
-SQL 문자열
--> 토큰(Token)
--> AST(Abstract Syntax Tree)
--> 실행기(Executor)
--> 메타/데이터 파일 접근
--> 결과 출력
+### 1. B+ 트리 인덱스
+
+- `id` 를 key, `.tbl` 파일의 row 시작 offset 을 value 로 저장합니다.
+- B+ 트리 노드와 헤더는 `users.idx` 같은 바이너리 인덱스 파일에 페이지 단위로 저장됩니다.
+- equality 는 단건 탐색, range 조건은 leaf linked list 를 따라 순차 방문합니다.
+- `!=` 는 전체 leaf 를 순회하면서 해당 key 만 제외합니다.
+
+### 2. 자동 ID 부여
+
+- `id` 컬럼을 빼고 INSERT 하면 현재 최대 id + 1 을 자동 부여합니다.
+- 이미 `id` 를 직접 넣는 INSERT 도 허용하지만, 중복 key 는 거절합니다.
+
+### 3. 컬럼 순서 재매핑
+
+- INSERT 시 컬럼 목록을 주면 스키마 헤더 기준으로 값을 재정렬합니다.
+- 예:
+
+```sql
+INSERT INTO users (email, name) VALUES ('carol@example.com', 'Carol');
 ```
 
-실제 저장소는 두 부분으로 나뉩니다.
+저장 결과:
 
-- 메타 파일: `meta/<schema>/<table>.schema.csv`
-- 데이터 파일: `data/<schema>/<table>.dat`
+```text
+3,Carol,carol@example.com
+```
 
-예를 들어 `school.users` 테이블은 아래 두 파일을 사용합니다.
+## 디스크/메모리 사용 방식
 
-- `meta/school/users.schema.csv`
-- `data/school/users.dat`
+`DBMS 구현인데 전부 RAM에 올려서 동작하면 안 되는 것 아니냐`는 지적에 대한 답은 명확합니다.
 
-## 2. 저장 구조
+- 이 구현은 전체 row를 메모리에 적재하지 않습니다.
+- B+ 트리 인덱스는 `users.idx` 바이너리 파일에 저장되며, 조회/삽입 때 필요한 노드를 디스크에서 읽고 씁니다.
+- 실제 row 데이터는 `.tbl` 파일에 남아 있고, 조회 시 필요한 row만 `fseek + fgets`로 읽습니다.
+- non-id 조건은 파일을 한 줄씩 선형 탐색합니다.
+- 인덱스 파일이 이미 있으면 재시작 후 그대로 사용하고, 비어 있거나 없을 때만 `.tbl`을 한 번 읽어 복구합니다.
 
-### 2.1 메타 파일
+즉 현재 구조는:
+
+- `in-memory table engine` 이 아니라
+- `binary on-disk B+ tree index + file-backed table` 구조입니다.
+
+즉 "row도 인덱스도 전부 메모리에 올려놓는 구현"은 아닙니다. 다만 row 파일은 아직 CSV 텍스트이므로, 비교 대상 레포처럼 데이터 파일까지 고정 길이 바이너리 레코드로 저장하는 단계까지는 가지 않았습니다.
+
+## 실행 시간 로그
+
+모든 SQL 실행은 `logs/query_timing.log` 에 기록됩니다.
+
+로그 항목:
+
+- `mode`
+  - `FILE`: SQL 파일 실행
+  - `API`: 엔진 직접 호출
+- `path`
+  - `insert`
+  - `indexed`
+  - `full_scan`
+  - `unknown`
+- `status`
+  - `ok`
+  - `error`
+- `time_ms`
+- `scanned_rows`
+- `matched_rows`
+- `sql`
 
 예시:
 
-```csv
-column_name,type,size
-id,INT,4
-name,CHAR,20
-age,INT,4
+```text
+2026-04-15 21:10:00 | mode=FILE | path=indexed | status=ok | time_ms=0.123 | scanned_rows=1 | matched_rows=1 | sql=SELECT name FROM users WHERE id = 2;
 ```
 
-의미:
-
-- `id`: 4바이트 정수
-- `name`: 20바이트 고정 길이 문자열
-- `age`: 4바이트 정수
-
-### 2.2 바이너리 데이터 파일
-
-`users` 한 row는 아래 순서로 저장됩니다.
+## 파일 구조
 
 ```text
-[id 4바이트][name 20바이트][age 4바이트]
+mini_sql/
+├── build.ps1
+├── Makefile
+├── data/
+│   └── users.tbl
+├── include/
+│   ├── ast.h
+│   ├── bptree.h
+│   ├── database.h
+│   ├── engine.h
+│   ├── executor.h
+│   ├── optimizer.h
+│   ├── parser.h
+│   ├── storage.h
+│   ├── tokenizer.h
+│   └── util.h
+├── sql/
+│   ├── insert_user.sql
+│   ├── select_all.sql
+│   ├── select_duplicate_columns.sql
+│   ├── select_names.sql
+│   └── select_where.sql
+└── src/
+    ├── ast.c
+    ├── benchmark_main.c
+    ├── bptree.c
+    ├── database.c
+    ├── engine.c
+    ├── executor.c
+    ├── main.c
+    ├── optimizer.c
+    ├── parser.c
+    ├── storage.c
+    ├── test_main.c
+    ├── tokenizer.c
+    └── util.c
 ```
 
-즉 row 하나의 크기는 `28`바이트입니다.
+## 빌드
 
-## 3. 전체 실행 흐름
-
-아래는 SQL 한 줄이 실제로 실행되는 전체 흐름입니다.
-
-```mermaid
-flowchart TD
-    A["SQL 입력"] --> B["lex_sql()"]
-    B --> C["TokenArray 생성"]
-    C --> D["parse_statement()"]
-    D --> E["AST 생성"]
-    E --> F["execute_statement()"]
-    F --> G["메타 로드"]
-    G --> H{"INSERT / SELECT 분기"}
-    H -->|INSERT| I["append_binary_row()"]
-    H -->|SELECT| J["execute_select()"]
-    I --> K[".dat 파일에 row 저장"]
-    J --> L["인덱스 탐색 또는 선형 탐색"]
-    K --> M["결과 출력"]
-    L --> M
-```
-
-주요 파일:
-
-- `src/main.c`
-- `src/lexer.c`
-- `src/parser.c`
-- `src/executor.c`
-- `src/storage.c`
-- `src/bptree.c`
-
-## 4. 토큰화는 어떻게 하는가
-
-토큰화는 `src/lexer.c`의 `lex_sql()`가 담당합니다.  
-이 함수는 SQL 문자열을 왼쪽부터 한 글자씩 읽으면서 의미 단위로 잘라 `TokenArray`에 넣습니다.
-
-### 4.1 대표 토큰
-
-- `TOKEN_IDENTIFIER`
-- `TOKEN_STRING`
-- `TOKEN_NUMBER`
-- `TOKEN_STAR`
-- `TOKEN_COMMA`
-- `TOKEN_DOT`
-- `TOKEN_LPAREN`
-- `TOKEN_RPAREN`
-- `TOKEN_EQUAL`
-- `TOKEN_NOT_EQUAL`
-- `TOKEN_GREATER`
-- `TOKEN_GREATER_EQUAL`
-- `TOKEN_LESS`
-- `TOKEN_LESS_EQUAL`
-- `TOKEN_KEYWORD_SELECT`
-- `TOKEN_KEYWORD_INSERT`
-- `TOKEN_KEYWORD_WHERE`
-- `TOKEN_KEYWORD_BETWEEN`
-- `TOKEN_KEYWORD_AND`
-
-중요한 점:
-
-- `school`, `users`, `age`, `name`는 lexer 단계에서는 전부 `TOKEN_IDENTIFIER`
-- `SELECT`, `INSERT`, `WHERE`, `BETWEEN`, `AND`는 키워드 토큰
-- schema인지 table인지 column인지는 parser가 문맥으로 판단
-
-### 4.2 토큰화 flowchart
-
-```mermaid
-flowchart TD
-    A["현재 문자 cursor 확인"] --> B{"공백인가?"}
-    B -->|예| C["건너뛰고 다음 문자"]
-    B -->|아니오| D{"구두점/연산자인가?"}
-    D -->|예| E["해당 TokenType으로 push"]
-    D -->|아니오| F{"작은따옴표 문자열인가?"}
-    F -->|예| G["문자열 끝까지 읽고 TOKEN_STRING 생성"]
-    F -->|아니오| H{"숫자인가?"}
-    H -->|예| I["숫자 끝까지 읽고 TOKEN_NUMBER 생성"]
-    H -->|아니오| J{"문자 또는 _ 로 시작하는가?"}
-    J -->|예| K["식별자 끝까지 읽음"]
-    K --> L{"예약어인가?"}
-    L -->|예| M["키워드 토큰 생성"]
-    L -->|아니오| N["TOKEN_IDENTIFIER 생성"]
-    J -->|아니오| O["Lexer error"]
-```
-
-### 4.3 예시
-
-입력:
-
-```sql
-SELECT name FROM users WHERE age BETWEEN 20 AND 30;
-```
-
-토큰 결과:
-
-```text
-TOKEN_KEYWORD_SELECT   "SELECT"
-TOKEN_IDENTIFIER       "name"
-TOKEN_KEYWORD_FROM     "FROM"
-TOKEN_IDENTIFIER       "users"
-TOKEN_KEYWORD_WHERE    "WHERE"
-TOKEN_IDENTIFIER       "age"
-TOKEN_KEYWORD_BETWEEN  "BETWEEN"
-TOKEN_NUMBER           "20"
-TOKEN_KEYWORD_AND      "AND"
-TOKEN_NUMBER           "30"
-TOKEN_SEMICOLON        ";"
-TOKEN_EOF              ""
-```
-
-## 5. AST를 어떻게 쓰는가
-
-이 프로젝트는 파싱 결과를 노드 기반 AST로 표현합니다.
-
-기본 노드 구조:
-
-```c
-typedef struct ASTNode {
-    NodeType type;
-    ASTValueType value_type;
-    char *text;
-    struct ASTNode *first_child;
-    struct ASTNode *next_sibling;
-} ASTNode;
-```
-
-핵심 필드:
-
-- `type`: 노드 종류
-- `text`: 컬럼명, 테이블명, literal 값, 연산자 문자열
-- `first_child`: 첫 번째 자식
-- `next_sibling`: 같은 부모를 가진 다음 형제
-
-즉 이 프로젝트는 `left/right` 이진트리보다는 `first_child + next_sibling` 방식의 일반 트리를 사용합니다.
-
-## 6. AST는 어떻게 만들어지는가
-
-`src/parser.c`의 `parse_statement()`가 시작점입니다.
-
-- 첫 토큰이 `INSERT`면 `parse_insert()`
-- 첫 토큰이 `SELECT`면 `parse_select()`
-
-그 안에서 다시:
-
-- `parse_table_node()`
-- `parse_column_list_node()`
-- `parse_where_node()`
-- `parse_value_list_node()`
-
-가 자식 노드를 만들어 연결합니다.
-
-### 6.1 AST 생성 flowchart
-
-```mermaid
-flowchart TD
-    A["parse_statement()"] --> B{"첫 토큰은?"}
-    B -->|INSERT| C["parse_insert()"]
-    B -->|SELECT| D["parse_select()"]
-    C --> E["TABLE 노드 생성"]
-    C --> F["VALUE_LIST 노드 생성"]
-    C --> G["NODE_INSERT 루트 생성"]
-    G --> H["TABLE, VALUE_LIST 연결"]
-    D --> I["COLUMN_LIST 노드 생성"]
-    D --> J["TABLE 노드 생성"]
-    D --> K{"WHERE 존재?"}
-    K -->|예| L["WHERE 노드 생성"]
-    K -->|아니오| M["WHERE 생략"]
-    D --> N["NODE_SELECT 루트 생성"]
-    N --> O["COLUMN_LIST, TABLE, WHERE 연결"]
-```
-
-## 7. AST 예시
-
-### 7.1 SELECT 예시
-
-```sql
-SELECT name FROM users WHERE id = 1;
-```
-
-AST:
-
-```text
-NODE_SELECT
-├── NODE_COLUMN_LIST
-│   └── NODE_COLUMN("name")
-├── NODE_TABLE
-│   ├── NODE_IDENTIFIER("school")
-│   └── NODE_IDENTIFIER("users")
-└── NODE_WHERE
-    ├── NODE_COLUMN("id")
-    ├── NODE_OPERATOR("=")
-    └── NODE_VALUE("1")
-```
-
-```mermaid
-flowchart TD
-    A["NODE_SELECT"] --> B["NODE_COLUMN_LIST"]
-    A --> C["NODE_TABLE"]
-    A --> D["NODE_WHERE"]
-    B --> E["NODE_COLUMN: name"]
-    C --> F["NODE_IDENTIFIER: school"]
-    C --> G["NODE_IDENTIFIER: users"]
-    D --> H["NODE_COLUMN: id"]
-    D --> I["NODE_OPERATOR: ="]
-    D --> J["NODE_VALUE: 1"]
-```
-
-### 7.2 BETWEEN 예시
-
-```sql
-SELECT * FROM users WHERE age BETWEEN 20 AND 30;
-```
-
-AST:
-
-```text
-NODE_SELECT
-├── NODE_COLUMN_LIST
-│   └── NODE_COLUMN("*")
-├── NODE_TABLE
-│   ├── NODE_IDENTIFIER("school")
-│   └── NODE_IDENTIFIER("users")
-└── NODE_WHERE
-    ├── NODE_COLUMN("age")
-    └── NODE_BETWEEN
-        ├── NODE_VALUE("20")
-        └── NODE_VALUE("30")
-```
-
-### 7.3 INSERT 예시
-
-```sql
-INSERT INTO users VALUES ('Kim', 20);
-```
-
-현재 버전에서는 `id`는 직접 넣지 않고 자동 증가합니다.
-
-AST:
-
-```text
-NODE_INSERT
-├── NODE_TABLE
-│   ├── NODE_IDENTIFIER("school")
-│   └── NODE_IDENTIFIER("users")
-└── NODE_VALUE_LIST
-    ├── NODE_VALUE("Kim")
-    └── NODE_VALUE("20")
-```
-
-## 8. AST를 실제 실행에 어떻게 쓰는가
-
-실행기는 AST를 직접 읽습니다.
-
-예를 들어 `execute_statement()`는:
-
-1. AST에서 `NODE_TABLE`을 찾음
-2. schema/table 이름 추출
-3. 메타 파일 로드
-4. 루트가 `NODE_INSERT`인지 `NODE_SELECT`인지 보고 분기
-
-즉 문자열을 다시 해석하는 게 아니라 AST를 따라가며 실행합니다.
-
-## 9. B+ 트리는 어떻게 쓰이는가
-
-이 프로젝트의 B+ 트리는 `src/bptree.c`에 있고, 현재는 `id` 단일 컬럼 전용입니다.
-
-- key: `id`
-- value: `row_offset`
-
-중요한 점:
-
-- 실제 row 전체는 메모리에 올리지 않음
-- 메타 정보와 `id -> row_offset` 인덱스만 메모리에 유지
-- 실제 데이터는 계속 `.dat` 파일에서 읽음
-
-## 10. B+ 트리를 메모리에 올리는 과정
-
-테이블 컨텍스트를 처음 준비할 때:
-
-1. `.dat` 파일을 처음부터 끝까지 읽음
-2. 각 row의 `id` 추출
-3. 해당 row의 파일 위치(`row_offset`) 계산
-4. B+ 트리에 `id -> row_offset` 삽입
-
-```mermaid
-flowchart TD
-    A["테이블 메타 로드"] --> B["users.dat 열기"]
-    B --> C["row_size 단위로 fread"]
-    C --> D["row에서 id 추출"]
-    D --> E["현재 row_offset 계산"]
-    E --> F["B+ 트리에 id -> row_offset 삽입"]
-    F --> G{"다음 row 존재?"}
-    G -->|예| C
-    G -->|아니오| H["인덱스 준비 완료"]
-```
-
-관련 함수:
-
-- `build_id_index_from_data()`
-- `bptree_insert()`
-
-## 11. 현재 인덱스를 타는 조건
-
-현재 B+ 트리를 사용하는 조건은 모두 `id` 컬럼 전용입니다.
-
-인덱스 사용:
-
-```sql
-SELECT * FROM users WHERE id = 3;
-SELECT * FROM users WHERE id > 3;
-SELECT * FROM users WHERE id >= 3;
-SELECT * FROM users WHERE id < 10;
-SELECT * FROM users WHERE id <= 10;
-SELECT * FROM users WHERE id BETWEEN 3 AND 10;
-```
-
-선형 탐색:
-
-```sql
-SELECT * FROM users WHERE id != 3;
-SELECT * FROM users WHERE age = 20;
-SELECT * FROM users WHERE name = 'Kim';
-SELECT * FROM users WHERE age BETWEEN 20 AND 30;
-```
-
-정리:
-
-- `WHERE id = 숫자`
-- `WHERE id > 숫자`
-- `WHERE id >= 숫자`
-- `WHERE id < 숫자`
-- `WHERE id <= 숫자`
-- `WHERE id BETWEEN low AND high`
-  는 B+ 트리
-- 그 외는 선형 탐색
-
-## 12. B+ 트리 검색은 어떻게 동작하는가
-
-### 12.1 `id = ?`
-
-```sql
-SELECT * FROM users WHERE id = 3;
-```
-
-흐름:
-
-1. `WHERE`가 `id = 숫자` 형태인지 확인
-2. `bptree_search()`로 정확한 key 검색
-3. `row_offset` 획득
-4. `.dat` 파일에서 그 위치의 row 하나만 읽기
-
-```mermaid
-flowchart TD
-    A["SELECT ... WHERE id = 3"] --> B["WHERE 구조 분석"]
-    B --> C["bptree_search(id)"]
-    C --> D["row_offset 획득"]
-    D --> E["fseek로 해당 위치 이동"]
-    E --> F["row 1개 fread"]
-    F --> G["컬럼 해석 후 출력"]
-```
-
-### 12.2 `>`, `>=`, `<`, `<=`, `BETWEEN`
-
-이제 `id` 컬럼의 범위 조건도 B+ 트리를 사용합니다.
-
-핵심 방식:
-
-- `>`, `>=`, `BETWEEN`은 `lower bound`로 시작 위치를 찾음
-- `<`, `<=`는 가장 왼쪽 leaf부터 시작
-- 그 다음 leaf의 `next`를 따라가며 범위를 순회
-
-```mermaid
-flowchart TD
-    A["SELECT ... WHERE id 조건"] --> B["WHERE 구조 분석"]
-    B --> C{"id 인덱스 조건인가?"}
-    C -->|=| D["bptree_search(id)"]
-    C -->|>, >=| E["lower_bound(start)"]
-    C -->|<, <=| F["leftmost leaf"]
-    C -->|BETWEEN| G["lower_bound(low)"]
-    D --> H["row_offset 획득"]
-    E --> I["leaf를 next로 순회"]
-    F --> I
-    G --> I
-    H --> J["해당 row 1개 읽기"]
-    I --> K["범위 내 row_offset들 읽기"]
-    J --> L["컬럼 해석 후 출력"]
-    K --> L
-```
-
-예를 들면:
-
-- `id >= 100`
-  - `lower_bound(100)`부터 끝까지
-- `id > 100`
-  - `lower_bound(100)`을 찾은 뒤 `100`과 같은 값은 건너뜀
-- `id <= 100`
-  - 가장 왼쪽 leaf부터 읽다가 `100`보다 큰 key가 나오면 중단
-- `id BETWEEN 100 AND 200`
-  - `lower_bound(100)`부터 시작해서 `200`을 넘는 순간 중단
-
-관련 함수:
-
-- `bptree_find_lower_bound()`
-- `bptree_leftmost_leaf()`
-- `select_by_id_index()`
-- `select_by_id_index_gt()`
-- `select_by_id_index_ge()`
-- `select_by_id_index_le()`
-- `select_by_id_index_between()`
-
-## 13. 선형 탐색은 어떻게 동작하는가
-
-예시:
-
-```sql
-SELECT * FROM users WHERE age = 20;
-SELECT * FROM users WHERE age BETWEEN 20 AND 30;
-SELECT * FROM users WHERE id != 3;
-```
-
-흐름:
-
-1. `.dat` 파일을 처음부터 끝까지 읽음
-2. 각 row에서 필요한 컬럼 위치를 메타로 찾음
-3. 조건과 비교
-4. 맞는 row만 출력
-
-```mermaid
-flowchart TD
-    A["SELECT ... WHERE non-index condition"] --> B["data 파일 열기"]
-    B --> C["row_size 단위로 fread"]
-    C --> D["row에서 컬럼 값 추출"]
-    D --> E["조건 비교"]
-    E --> F{"일치하는가?"}
-    F -->|예| G["출력"]
-    F -->|아니오| H["다음 row"]
-    G --> H
-    H --> I{"다음 row 존재?"}
-    I -->|예| C
-    I -->|아니오| J["종료"]
-```
-
-## 14. 지원 SQL
-
-### INSERT
-
-`id`는 자동 증가이므로 직접 넣지 않습니다.
-
-```sql
-INSERT INTO users VALUES ('Kim', 20);
-INSERT INTO school.users VALUES ('Lee', 25);
-```
-
-### SELECT
-
-```sql
-SELECT * FROM users;
-SELECT name FROM users WHERE id = 1;
-SELECT * FROM users WHERE id >= 10;
-SELECT * FROM users WHERE id BETWEEN 10 AND 20;
-SELECT * FROM users WHERE age = 20;
-SELECT * FROM users WHERE age BETWEEN 20 AND 30;
-```
-
-### 현재 지원하는 비교
-
-- `=`
-- `!=`
-- `>`
-- `>=`
-- `<`
-- `<=`
-- `BETWEEN low AND high`
-
-### 현재 지원하지 않는 것
-
-- `AND`
-- `OR`
-- 다중 WHERE 조건
-- 괄호식
-- JOIN
-- UPDATE
-- DELETE
-- ORDER BY
-- GROUP BY
-
-## 15. 빌드
-
-### Windows (GCC)
+### Windows / PowerShell
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -pedantic -Isrc -o sql_processor_bptree src\main.c src\lexer.c src\parser.c src\meta.c src\storage.c src\executor.c src\util.c src\bptree.c
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+생성 파일:
+
+- `mini_sql.exe`
+- `mini_sql_tests.exe`
+- `mini_sql_benchmark.exe`
+
+### Linux/macOS
+
+```bash
+make
 ```
 
 ### Docker
 
-```powershell
-docker build -t sql-insert-select .
-docker run --rm -it -v "${PWD}:/workspace" sql-insert-select
+```bash
+docker build -t mini-sql-bptree .
 ```
 
-### REPL 실행
+기본 실행은 REPL 이며, Docker named volume 으로 데이터가 유지됩니다.
 
-```powershell
-.\sql_processor_bptree.exe --repl
+```bash
+docker run --rm -it mini-sql-bptree
 ```
 
-### 샘플 SQL 실행
+원하는 바이너리를 직접 실행할 수도 있습니다.
 
-```powershell
-.\sql_processor_bptree.exe sample_select.sql
-.\sql_processor_bptree.exe sample_insert.sql
-.\sql_processor_bptree.exe sample_where_between.sql
+```bash
+docker run --rm mini-sql-bptree ./mini_sql sql/select_where.sql
+docker run --rm mini-sql-bptree ./mini_sql_tests
+docker run --rm mini-sql-bptree ./mini_sql_benchmark --rows 1000000 --repetitions 1
 ```
 
-## 16. 대량 데이터 생성기
+기본 `make docker-repl` / `make docker-run` 은 `mini-sql-bptree-data` named volume 을 사용하므로 컨테이너를 껐다 켜도 데이터가 남습니다.
 
-파일:
+```bash
+docker volume ls
+```
 
-- `tools/generate_records.py`
+Makefile 타깃도 제공합니다.
+
+```bash
+make docker-build
+make docker-test
+make docker-run
+make docker-repl
+make docker-benchmark
+make docker-seed-million
+```
+
+## 실행
+
+```powershell
+.\mini_sql.exe
+.\mini_sql.exe --repl
+.\mini_sql.exe sql\select_all.sql
+.\mini_sql.exe sql\select_where.sql
+.\mini_sql.exe sql\insert_user.sql
+```
+
+REPL 예시:
+
+```text
+sql> SELECT name, email, age FROM users WHERE id >= 2;
+name,email,age
+Bob,bob@example.com,25
+[indexed] time_ms=0.123 scanned_rows=1 matched_rows=1
+sql> INSERT INTO users (email, name, age) VALUES ('carol@example.com', 'Carol', 30);
+Inserted 1 row into users
+[insert] time_ms=0.456
+sql> EXIT;
+```
 
 예시:
 
-```powershell
-python tools\generate_records.py --count 1000000 --output generated_records.sql --seed 20260415
+```sql
+SELECT name, email, age FROM users WHERE id >= 2;
 ```
 
-생성 SQL 형식:
+출력:
+
+```text
+name,email,age
+Bob,bob@example.com,25
+```
+
+## 테스트
+
+```powershell
+.\mini_sql_tests.exe
+```
+
+검증 항목:
+
+- B+ 트리 insert/search/range visit
+- 자동 ID 부여
+- `INSERT (email, name)` 컬럼 순서 재매핑
+- `id` 조건의 `=`, `<`, `>=`, `!=` 인덱스 경로
+- non-id 조건 선형 탐색 유지
+
+## 벤치마크
+
+```powershell
+.\mini_sql_benchmark.exe --rows 1000000 --repetitions 1
+```
+
+벤치마크는 다음 SQL 경로를 그대로 사용합니다.
+
+- 1,000,000회:
+  - 랜덤 `name`, 랜덤 `email`, 랜덤 `age` 생성 후 `INSERT INTO users (name, email, age) VALUES (...)`
+- 인덱스 비교:
+  - 랜덤하게 뽑은 `id` 에 대한 `SELECT ... WHERE id = ?`
+  - 랜덤 시작점에 대한 `SELECT ... WHERE id >= ?`
+- 선형 탐색 비교:
+  - 삽입 중 샘플링한 랜덤 `email` 에 대한 `SELECT ... WHERE email = ?`
+
+주의:
+
+- 일반 실행기와 REPL의 INSERT 결과는 `.tbl` 파일에 저장되므로 프로그램을 껐다 켜도 유지됩니다.
+- 시작할 때 `.idx` 인덱스 파일이 있으면 그대로 사용하고, 없거나 비어 있을 때만 `.tbl`을 읽어 재구성합니다.
+- 단, `mini_sql_benchmark` 는 매 실행마다 `benchmark_data/users.tbl` 을 새로 만들어 다시 측정합니다.
+- 도커 REPL/실행은 기본적으로 named volume 을 쓰도록 Makefile 에 맞춰뒀습니다.
+
+## 100만 건 시드 데이터
+
+테스트용으로 1,000,000건의 랜덤 사용자 데이터를 SQL 엔진으로 실제 INSERT 하려면:
+
+```bash
+make docker-seed-million
+```
+
+특징:
+
+- 컬럼: `id,name,email,age`
+- `id` 는 자동 증가
+- `name`, `email`, `age` 는 랜덤 생성
+- 단 하나의 고정 테스트 케이스를 반드시 포함
+  - `name = 'CHOIHYUNJIN'`
+  - `email = 'guswls1478@gmail.com'`
+  - `age = 24`
+
+생성 후 같은 데이터는 아래처럼 다시 조회할 수 있습니다.
+
+```bash
+make docker-repl
+```
 
 ```sql
-INSERT INTO users VALUES ('Alice', 27);
+SELECT * FROM users WHERE email = 'guswls1478@gmail.com';
+SELECT * FROM users WHERE id = 777777;
 ```
 
-## 17. 성능 측정
+### 실제 실행 결과
 
-PowerShell 예시:
+이 환경에서 직접 실행한 결과:
 
-```powershell
-Set-Content q_id_eq.sql "SELECT * FROM users WHERE id = 500000;"
-Set-Content q_id_range.sql "SELECT * FROM users WHERE id BETWEEN 500000 AND 500100;"
-Set-Content q_age.sql "SELECT * FROM users WHERE age = 30;"
-
-Measure-Command { .\sql_processor_bptree.exe q_id_eq.sql *> $null }
-Measure-Command { .\sql_processor_bptree.exe q_id_range.sql *> $null }
-Measure-Command { .\sql_processor_bptree.exe q_age.sql *> $null }
+```text
+Rows inserted: 1000000
+Insert elapsed: 374867.00 ms
+id equality avg: 0.0000 ms
+  used_index=1 scanned_rows=1 matched_rows=1
+id range avg: 0.0000 ms
+  used_index=1 scanned_rows=10 matched_rows=10
+email equality avg: 674.0000 ms
+  used_index=0 scanned_rows=1000000 matched_rows=1
 ```
 
-의미:
+핵심 차이:
 
-- `id = ?`, `id > ?`, `id >= ?`, `id < ?`, `id <= ?`, `id BETWEEN ? AND ?`는 B+ 트리
-- `age = ?`, `name = ?`, `id != ?`, `age BETWEEN ? AND ?`는 선형 탐색
+- `id` 기반 조회는 B+ 트리가 바로 offset 을 찾아서 필요한 row만 읽습니다.
+- `email` 기반 조회는 파일 전체를 끝까지 선형 스캔합니다.
 
-## 18. 쿼리 시간 로그
+## 팀4 저장소와 비교
 
-실행된 SQL은 아래 파일에 로그를 남깁니다.
+비교 대상:
 
-- `logs/query_timing.log`
+- `Jungle-12-303/week7-team4-sql-processor-Bp-tree-index`
 
-로그에는 아래 정보가 포함됩니다.
+### 기능/구조 비교
 
-- 실행 모드(file/repl)
-- SQL 문자열
-- 실행 시간(ms)
-- 실행 경로
-  - `INSERT`
-  - `INDEXED`
-  - `FULL_SCAN`
-  - `UNKNOWN`
+| 항목 | 팀4 저장소 | 현재 mini_sql |
+|---|---|---|
+| 저장 포맷 | `meta + binary .dat` | 바이너리 `.idx` + 텍스트 `.tbl` |
+| SQL 범위 | `schema.table`, `BETWEEN`, REPL 포함 | 최소 SQL + 컬럼 매핑 INSERT |
+| 인덱스 조건 | `id =, >, >=, <, <=, BETWEEN` | `id =, !=, <, <=, >, >=` |
+| `id !=` 인덱스 | 미사용 | 사용 |
+| INSERT 컬럼 목록 | 없음 | 있음 |
+| 자동 ID | 있음 | 있음 |
+| 실행 시간 로그 | 있음 | 있음 |
+| 대량 벤치마크 러너 | 수동/스크립트 중심 | 실행 파일로 포함 |
+| 테스트 | B+ 트리 + BETWEEN 파싱 | B+ 트리 + INSERT 매핑 + 인덱스 경로 |
 
-## 19. 테스트
+### 탑다운 최소구현 과제 관점 비교
 
-단위 테스트:
+| 관점 | 팀4 저장소 | 현재 mini_sql |
+|---|---|---|
+| 과제 필수조건만 빠르게 맞추기 | 범위가 조금 큼 | 더 적합 |
+| 기존 SQL 처리기에 최소 침투 | 보통 | 강함 |
+| 발표 시 설명 난이도 | 다소 높음 | 낮음 |
+| 구현량 대비 결과 데모 | 큼 | 효율적 |
+| "WHERE id 조건은 인덱스" 메시지 전달 | 명확 | 더 직접적 |
 
-```powershell
-gcc -std=c11 -Wall -Wextra -pedantic -Isrc -o tests\bptree_tests.exe tests\bptree_tests.c src\lexer.c src\parser.c src\util.c src\bptree.c
-.\tests\bptree_tests.exe
-```
+### 공부 관점 비교
 
-현재 테스트는 최소한 아래를 확인합니다.
+| 관점 | 팀4 저장소 | 현재 mini_sql |
+|---|---|---|
+| 실제 DBMS 느낌 | 더 강함 | 충분함 |
+| 저장소/메타 분리 학습 | 좋음 | 보통 |
+| 바이너리 row 해석 학습 | 좋음 | 없음 |
+| 바이너리 index/page 해석 학습 | 좋음 | 충분함 |
+| B+ 트리 범위 스캔 학습 | 좋음 | 충분함 |
+| SQL 파이프라인 이해 | 충분함 | 충분함 |
+| MVP 설계 감각 | 보통 | 좋음 |
 
-- B+ 트리 삽입/검색
-- `BETWEEN` 파싱 AST 구조
+정리하면:
 
-## 20. 제한 사항
+- 팀4 저장소는 "더 넓게 구현한 미니 DBMS" 쪽입니다.
+- 현재 mini_sql은 "기존 코드에 최소 수정으로 과제 필수조건을 빠르게 만족시키는 탑다운 MVP" 쪽입니다.
+- 발표에서 방어하기 쉬운 쪽은 현재 mini_sql이고, 공부용으로 파고들기 좋은 쪽은 팀4 저장소입니다.
 
-- B+ 트리는 `id` 전용
-- 인덱스는 메모리에만 유지
-- 프로그램 시작 또는 테이블 preload 시 `.dat`를 읽어 인덱스 재구축
-- `BETWEEN`은 INT 컬럼만 허용
-- `AND`, `OR`, 다중 조건 미지원
+## 발표 포인트
 
-## 21. 관련 문서
-
-- `AGENT.md`
-- `sudo/pseudocode.md`
-- `check.md`
-- `context.md`
-
-## 22. 한 줄 요약
-
-이 프로젝트는 SQL을 토큰화하고 AST로 바꾼 뒤, `id` 컬럼의 `=`, `>`, `>=`, `<`, `<=`, `BETWEEN`은 메모리 B+ 트리로 처리하고, 그 외 조건은 바이너리 파일을 선형 탐색하는 파일 기반 미니 DBMS입니다.
+- 기존 SQL 처리기는 그대로 두고 executor 뒤의 storage 접근만 인덱스 친화적으로 바꿨습니다.
+- B+ 트리 value 를 row pointer 대신 file offset 으로 둬서 전체 row를 RAM에 올리지 않습니다.
+- `WHERE id <op> ?` 전체를 인덱스로 처리해 equality-only 최적화보다 범위가 넓습니다.
+- `INSERT (email, name)` 같은 컬럼 순서 재매핑을 지원합니다.
+- 실행 시간 로그를 남겨 인덱스 사용 여부를 발표에서 바로 보여줄 수 있습니다.

@@ -1,340 +1,647 @@
-#include "sql_processor.h"
+#include "bptree.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * 삽입 중 split이 발생했을 때 부모 호출자에게 전달할 결과 구조체다.
- *
- * 필드 의미:
- * - did_split: 현재 노드에서 분할이 일어났는지 여부
- * - promoted_key: 부모로 올려보낼 기준 key
- * - right_node: 분할 후 오른쪽 새 노드
- */
+#define BPTREE_MAGIC "BPTIDX1"
+#define BPTREE_MAGIC_SIZE 8
+#define BPTREE_HEADER_SIZE 64
+#define BPTREE_NODE_SIZE (16 + (4 * BPTREE_MAX_KEYS) + (8 * (BPTREE_MAX_KEYS + 1)) + (8 * BPTREE_MAX_KEYS))
+
 typedef struct {
-    int did_split;
+    int32_t is_leaf;
+    int32_t key_count;
+    int64_t next_leaf_page;
+    int32_t keys[BPTREE_MAX_KEYS + 1];
+    int64_t children[BPTREE_MAX_KEYS + 2];
+    int64_t values[BPTREE_MAX_KEYS + 1];
+} DiskBPlusTreeNode;
+
+typedef struct {
+    int has_split;
     int promoted_key;
-    BPTreeNode *right_node;
-} BPTreeInsertResult;
+    int64_t right_page;
+} InsertResult;
 
-/*
- * B+ 트리 노드 하나를 생성한다.
- *
- * 입력:
- * - is_leaf: 1이면 leaf node, 0이면 internal node
- *
- * 내부 동작:
- * - 노드를 malloc
- * - 메모리를 0으로 초기화
- * - is_leaf 플래그 설정
- */
-static BPTreeNode *create_bptree_node(int is_leaf) {
-    BPTreeNode *node; /* 새로 만들 노드 */
-
-    node = (BPTreeNode *)malloc(sizeof(BPTreeNode));
-    if (node == NULL) {
-        return NULL;
-    }
-
-    memset(node, 0, sizeof(*node));
-    node->is_leaf = is_leaf;
-    return node;
+static long long page_offset(int64_t page_id) {
+    return (long long)BPTREE_HEADER_SIZE + (long long)(page_id - 1) * (long long)BPTREE_NODE_SIZE;
 }
 
-/*
- * 노드와 그 하위 child 포인터를 따라가며 B+ 트리 메모리를 해제한다.
- *
- * 주의:
- * - leaf의 next 포인터는 해제 순회를 위해 사용하지 않는다.
- * - child 포인터 계층만 따라가도 전체 트리를 한 번만 해제할 수 있다.
- */
-static void free_bptree_node(BPTreeNode *node) {
-    int i; /* internal node의 자식 배열 순회 인덱스 */
-
-    if (node == NULL) {
-        return;
-    }
-
-    if (!node->is_leaf) {
-        for (i = 0; i <= node->key_count; i++) {
-            free_bptree_node(node->children[i]);
-        }
-    }
-
-    free(node);
+static int set_error(char *error_buf, size_t error_buf_size, const char *message) {
+    snprintf(error_buf, error_buf_size, "%s", message);
+    return 0;
 }
 
-/*
- * leaf 노드에서 key가 들어가야 할 정렬 위치를 찾는다.
- *
- * 예:
- * - keys = [1, 3, 7]
- * - key = 5
- * -> 반환값은 2
- */
-static int find_leaf_insert_index(BPTreeNode *node, int key) {
-    int index = 0; /* 삽입 위치를 찾기 위해 움직이는 인덱스 */
-
-    while (index < node->key_count && node->keys[index] < key) {
-        index++;
+static int seek_file(FILE *file, long long offset, char *error_buf, size_t error_buf_size) {
+    if (fseek(file, (long)offset, SEEK_SET) != 0) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일 포인터를 이동하는 데 실패했습니다.");
     }
-    return index;
+    return 1;
 }
 
-/*
- * internal node에서 어떤 child로 내려가야 하는지 찾는다.
- *
- * 규칙:
- * - 현재 key보다 작은 separator는 지나가고
- * - 처음으로 더 큰 separator를 만나기 전 child로 내려간다.
- */
-static int find_child_index(BPTreeNode *node, int key) {
-    int index = 0; /* child 선택을 위한 인덱스 */
-
-    while (index < node->key_count && key >= node->keys[index]) {
-        index++;
+static int write_bytes(FILE *file, const void *data, size_t size, char *error_buf, size_t error_buf_size) {
+    if (fwrite(data, 1, size, file) != size) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일에 쓰는 데 실패했습니다.");
     }
-    return index;
+    return 1;
 }
 
-/*
- * leaf node에 key/offset을 삽입한다.
- *
- * 동작:
- * - 정렬 위치를 찾는다.
- * - 뒤쪽 key/offset을 한 칸씩 민다.
- * - 새 key/offset을 넣는다.
- * - overflow면 leaf split을 수행한다.
- *
- * 반환:
- * - split 없으면 did_split = 0
- * - split 있으면 promoted_key와 right_node를 채워 반환
- */
-static BPTreeInsertResult insert_into_leaf(BPTreeNode *node, int key, long offset, Status *status) {
-    BPTreeInsertResult result; /* 부모에게 돌려줄 split 결과 */
-    int insert_index;          /* 새 key가 들어갈 정렬 위치 */
-    int i;                     /* 뒤쪽 배열을 미는 반복 변수 */
-
-    memset(&result, 0, sizeof(result));
-
-    insert_index = find_leaf_insert_index(node, key);
-    if (insert_index < node->key_count && node->keys[insert_index] == key) {
-        snprintf(status->message, sizeof(status->message), "Execution error: duplicate id key '%d'", key);
-        return result;
+static int read_bytes(FILE *file, void *data, size_t size, char *error_buf, size_t error_buf_size) {
+    if (fread(data, 1, size, file) != size) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일을 읽는 데 실패했습니다.");
     }
-
-    for (i = node->key_count; i > insert_index; i--) {
-        node->keys[i] = node->keys[i - 1];
-        node->offsets[i] = node->offsets[i - 1];
-    }
-
-    node->keys[insert_index] = key;
-    node->offsets[insert_index] = offset;
-    node->key_count++;
-
-    if (node->key_count <= BPTREE_MAX_KEYS) {
-        return result;
-    }
-
-    {
-        int split_index = node->key_count / 2; /* 왼쪽 leaf가 유지할 key 수 */
-        int total_keys = node->key_count;      /* split 전 전체 key 수 */
-        BPTreeNode *right = create_bptree_node(1); /* 새 오른쪽 leaf */
-
-        if (right == NULL) {
-            snprintf(status->message, sizeof(status->message), "Execution error: out of memory");
-            result.promoted_key = 0;
-            return result;
-        }
-
-        right->key_count = total_keys - split_index;
-        for (i = 0; i < right->key_count; i++) {
-            right->keys[i] = node->keys[split_index + i];
-            right->offsets[i] = node->offsets[split_index + i];
-        }
-
-        node->key_count = split_index;
-        right->next = node->next;
-        node->next = right;
-
-        result.did_split = 1;
-        result.promoted_key = right->keys[0];
-        result.right_node = right;
-        return result;
-    }
+    return 1;
 }
 
-/*
- * internal node 아래 적절한 child에 삽입을 재귀 호출한다.
- *
- * child 쪽 split이 발생하면:
- * - promoted_key를 현재 internal node에 끼워 넣고
- * - 오른쪽 새 child 포인터를 연결한다.
- *
- * 현재 internal node도 overflow하면 다시 split 결과를 부모로 올린다.
- */
-static BPTreeInsertResult insert_into_internal(BPTreeNode *node, int key, long offset, Status *status) {
-    BPTreeInsertResult child_result; /* child 삽입 결과 */
-    BPTreeInsertResult result;       /* 현재 노드 삽입 결과 */
-    int child_index;                 /* 내려갈 child 위치 */
-    int i;                           /* 배열 이동 반복 변수 */
+static int write_header(BPlusTree *tree, char *error_buf, size_t error_buf_size) {
+    char magic[BPTREE_MAGIC_SIZE] = BPTREE_MAGIC;
+    int32_t version = 1;
+    int32_t max_keys = BPTREE_MAX_KEYS;
+    char padding[BPTREE_HEADER_SIZE - BPTREE_MAGIC_SIZE - (2 * (int)sizeof(int32_t)) - (4 * (int)sizeof(int64_t)) - (int)sizeof(int32_t)];
 
-    memset(&result, 0, sizeof(result));
+    memset(padding, 0, sizeof(padding));
 
-    child_index = find_child_index(node, key);
-    child_result = node->children[child_index]->is_leaf
-        ? insert_into_leaf(node->children[child_index], key, offset, status)
-        : insert_into_internal(node->children[child_index], key, offset, status);
-
-    if (status->message[0] != '\0') {
-        return result;
+    if (!seek_file(tree->file, 0, error_buf, error_buf_size)) {
+        return 0;
     }
-    if (!child_result.did_split) {
-        return result;
+    if (!write_bytes(tree->file, magic, sizeof(magic), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &version, sizeof(version), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &max_keys, sizeof(max_keys), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &tree->root_page, sizeof(tree->root_page), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &tree->first_leaf_page, sizeof(tree->first_leaf_page), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &tree->page_count, sizeof(tree->page_count), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &tree->key_count, sizeof(tree->key_count), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &tree->next_id, sizeof(tree->next_id), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, padding, sizeof(padding), error_buf, error_buf_size)) {
+        return 0;
     }
-
-    for (i = node->key_count; i > child_index; i--) {
-        node->keys[i] = node->keys[i - 1];
-    }
-    for (i = node->key_count + 1; i > child_index + 1; i--) {
-        node->children[i] = node->children[i - 1];
-    }
-
-    node->keys[child_index] = child_result.promoted_key;
-    node->children[child_index + 1] = child_result.right_node;
-    node->key_count++;
-
-    if (node->key_count <= BPTREE_MAX_KEYS) {
-        return result;
-    }
-
-    {
-        int mid_index = node->key_count / 2;   /* 부모로 올릴 separator 위치 */
-        int total_keys = node->key_count;      /* split 전 전체 key 수 */
-        BPTreeNode *right = create_bptree_node(0); /* 새 오른쪽 internal node */
-
-        if (right == NULL) {
-            snprintf(status->message, sizeof(status->message), "Execution error: out of memory");
-            return result;
-        }
-
-        right->key_count = total_keys - mid_index - 1;
-        for (i = 0; i < right->key_count; i++) {
-            right->keys[i] = node->keys[mid_index + 1 + i];
-        }
-        for (i = 0; i <= right->key_count; i++) {
-            right->children[i] = node->children[mid_index + 1 + i];
-        }
-
-        result.did_split = 1;
-        result.promoted_key = node->keys[mid_index];
-        result.right_node = right;
-        node->key_count = mid_index;
-    }
-
-    return result;
+    return 1;
 }
 
-/* B+ 트리를 빈 상태로 초기화한다. */
-void bptree_init(BPTree *tree) {
-    if (tree == NULL) {
-        return;
+static int read_header(BPlusTree *tree, char *error_buf, size_t error_buf_size) {
+    char magic[BPTREE_MAGIC_SIZE];
+    int32_t version;
+    int32_t max_keys;
+    int32_t next_id;
+    char padding[BPTREE_HEADER_SIZE - BPTREE_MAGIC_SIZE - (2 * (int)sizeof(int32_t)) - (4 * (int)sizeof(int64_t)) - (int)sizeof(int32_t)];
+
+    if (!seek_file(tree->file, 0, error_buf, error_buf_size)) {
+        return 0;
     }
-    tree->root = NULL;
-}
-
-/* B+ 트리 전체 메모리를 해제한다. */
-void bptree_free(BPTree *tree) {
-    if (tree == NULL) {
-        return;
-    }
-
-    free_bptree_node(tree->root);
-    tree->root = NULL;
-}
-
-/*
- * key 하나를 B+ 트리에 삽입한다.
- *
- * 흐름:
- * - root가 없으면 leaf root를 새로 만든다.
- * - root가 leaf면 바로 leaf 삽입
- * - root가 internal이면 재귀 삽입
- * - root split이 발생하면 새 root를 만든다.
- */
-int bptree_insert(BPTree *tree, int key, long offset, Status *status) {
-    BPTreeInsertResult result; /* root 삽입 결과 */
-
-    if (tree->root == NULL) {
-        tree->root = create_bptree_node(1);
-        if (tree->root == NULL) {
-            snprintf(status->message, sizeof(status->message), "Execution error: out of memory");
-            return 0;
-        }
-        tree->root->keys[0] = key;
-        tree->root->offsets[0] = offset;
-        tree->root->key_count = 1;
-        return 1;
-    }
-
-    status->ok = 1;
-    status->message[0] = '\0';
-
-    result = tree->root->is_leaf
-        ? insert_into_leaf(tree->root, key, offset, status)
-        : insert_into_internal(tree->root, key, offset, status);
-
-    if (status->message[0] != '\0') {
-        status->ok = 0;
+    if (!read_bytes(tree->file, magic, sizeof(magic), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &version, sizeof(version), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &max_keys, sizeof(max_keys), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &tree->root_page, sizeof(tree->root_page), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &tree->first_leaf_page, sizeof(tree->first_leaf_page), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &tree->page_count, sizeof(tree->page_count), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &tree->key_count, sizeof(tree->key_count), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &next_id, sizeof(next_id), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, padding, sizeof(padding), error_buf, error_buf_size)) {
         return 0;
     }
 
-    if (result.did_split) {
-        BPTreeNode *new_root = create_bptree_node(0); /* split 후 새 root */
-        if (new_root == NULL) {
-            snprintf(status->message, sizeof(status->message), "Execution error: out of memory");
-            status->ok = 0;
+    if (memcmp(magic, BPTREE_MAGIC, BPTREE_MAGIC_SIZE) != 0) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일 매직이 올바르지 않습니다.");
+    }
+    if (version != 1) {
+        return set_error(error_buf, error_buf_size, "지원하지 않는 인덱스 파일 버전입니다.");
+    }
+    if (max_keys != BPTREE_MAX_KEYS) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일 차수 설정이 현재 실행 파일과 다릅니다.");
+    }
+
+    tree->next_id = next_id;
+    return 1;
+}
+
+static int write_node(BPlusTree *tree,
+                      int64_t page_id,
+                      const DiskBPlusTreeNode *node,
+                      char *error_buf,
+                      size_t error_buf_size) {
+    size_t index;
+
+    if (node->key_count < 0 || node->key_count > BPTREE_MAX_KEYS) {
+        return set_error(error_buf, error_buf_size, "디스크에 기록할 수 없는 노드 크기입니다.");
+    }
+
+    if (!seek_file(tree->file, page_offset(page_id), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &node->is_leaf, sizeof(node->is_leaf), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &node->key_count, sizeof(node->key_count), error_buf, error_buf_size) ||
+        !write_bytes(tree->file, &node->next_leaf_page, sizeof(node->next_leaf_page), error_buf, error_buf_size)) {
+        return 0;
+    }
+
+    for (index = 0; index < BPTREE_MAX_KEYS; ++index) {
+        if (!write_bytes(tree->file, &node->keys[index], sizeof(node->keys[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+    for (index = 0; index < BPTREE_MAX_KEYS + 1; ++index) {
+        if (!write_bytes(tree->file, &node->children[index], sizeof(node->children[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+    for (index = 0; index < BPTREE_MAX_KEYS; ++index) {
+        if (!write_bytes(tree->file, &node->values[index], sizeof(node->values[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int read_node(BPlusTree *tree,
+                     int64_t page_id,
+                     DiskBPlusTreeNode *node,
+                     char *error_buf,
+                     size_t error_buf_size) {
+    size_t index;
+
+    memset(node, 0, sizeof(*node));
+
+    if (page_id <= 0 || page_id > tree->page_count) {
+        return set_error(error_buf, error_buf_size, "유효하지 않은 인덱스 페이지 번호입니다.");
+    }
+
+    if (!seek_file(tree->file, page_offset(page_id), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &node->is_leaf, sizeof(node->is_leaf), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &node->key_count, sizeof(node->key_count), error_buf, error_buf_size) ||
+        !read_bytes(tree->file, &node->next_leaf_page, sizeof(node->next_leaf_page), error_buf, error_buf_size)) {
+        return 0;
+    }
+
+    for (index = 0; index < BPTREE_MAX_KEYS; ++index) {
+        if (!read_bytes(tree->file, &node->keys[index], sizeof(node->keys[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+    for (index = 0; index < BPTREE_MAX_KEYS + 1; ++index) {
+        if (!read_bytes(tree->file, &node->children[index], sizeof(node->children[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+    for (index = 0; index < BPTREE_MAX_KEYS; ++index) {
+        if (!read_bytes(tree->file, &node->values[index], sizeof(node->values[index]), error_buf, error_buf_size)) {
+            return 0;
+        }
+    }
+
+    if (node->key_count < 0 || node->key_count > BPTREE_MAX_KEYS) {
+        return set_error(error_buf, error_buf_size, "인덱스 노드의 key 수가 손상되었습니다.");
+    }
+    return 1;
+}
+
+static int64_t allocate_page(BPlusTree *tree, char *error_buf, size_t error_buf_size) {
+    int64_t page_id = tree->page_count + 1;
+    DiskBPlusTreeNode zero_node;
+
+    memset(&zero_node, 0, sizeof(zero_node));
+    tree->page_count = page_id;
+    if (!write_header(tree, error_buf, error_buf_size) ||
+        !write_node(tree, page_id, &zero_node, error_buf, error_buf_size)) {
+        return 0;
+    }
+    return page_id;
+}
+
+static size_t find_insert_index(const DiskBPlusTreeNode *node, int key) {
+    size_t index = 0;
+
+    while (index < (size_t)node->key_count && node->keys[index] < key) {
+        ++index;
+    }
+
+    return index;
+}
+
+static size_t find_child_index(const DiskBPlusTreeNode *node, int key) {
+    size_t index = 0;
+
+    while (index < (size_t)node->key_count && key >= node->keys[index]) {
+        ++index;
+    }
+
+    return index;
+}
+
+static int64_t find_leaf_page(BPlusTree *tree, int key, char *error_buf, size_t error_buf_size) {
+    int64_t page_id = tree->root_page;
+    DiskBPlusTreeNode node;
+
+    while (page_id != 0) {
+        if (!read_node(tree, page_id, &node, error_buf, error_buf_size)) {
+            return -1;
+        }
+        if (node.is_leaf) {
+            return page_id;
+        }
+        page_id = node.children[find_child_index(&node, key)];
+    }
+
+    return 0;
+}
+
+static InsertResult make_no_split(void) {
+    InsertResult result;
+
+    result.has_split = 0;
+    result.promoted_key = 0;
+    result.right_page = 0;
+    return result;
+}
+
+static InsertResult insert_recursive(BPlusTree *tree,
+                                     int64_t page_id,
+                                     int key,
+                                     long value,
+                                     int *duplicate_key,
+                                     char *error_buf,
+                                     size_t error_buf_size) {
+    DiskBPlusTreeNode node;
+    InsertResult result = make_no_split();
+    size_t index;
+
+    if (!read_node(tree, page_id, &node, error_buf, error_buf_size)) {
+        *duplicate_key = -1;
+        return result;
+    }
+
+    if (node.is_leaf) {
+        int64_t right_page;
+        DiskBPlusTreeNode right_node;
+        size_t split_index;
+        size_t right_count;
+
+        index = find_insert_index(&node, key);
+        if (index < (size_t)node.key_count && node.keys[index] == key) {
+            *duplicate_key = 1;
+            return result;
+        }
+
+        for (; index < (size_t)node.key_count; ++index) {
+            if (node.keys[index] >= key) {
+                break;
+            }
+        }
+        for (size_t shift = (size_t)node.key_count; shift > index; --shift) {
+            node.keys[shift] = node.keys[shift - 1];
+            node.values[shift] = node.values[shift - 1];
+        }
+
+        node.keys[index] = key;
+        node.values[index] = value;
+        ++node.key_count;
+
+        if (node.key_count <= BPTREE_MAX_KEYS) {
+            if (!write_node(tree, page_id, &node, error_buf, error_buf_size)) {
+                *duplicate_key = -1;
+            }
+            return result;
+        }
+
+        memset(&right_node, 0, sizeof(right_node));
+        right_node.is_leaf = 1;
+
+        split_index = (size_t)node.key_count / 2;
+        right_count = (size_t)node.key_count - split_index;
+        for (index = 0; index < right_count; ++index) {
+            right_node.keys[index] = node.keys[split_index + index];
+            right_node.values[index] = node.values[split_index + index];
+        }
+        right_node.key_count = (int32_t)right_count;
+        node.key_count = (int32_t)split_index;
+
+        right_page = allocate_page(tree, error_buf, error_buf_size);
+        if (right_page == 0) {
+            *duplicate_key = -1;
+            return result;
+        }
+
+        right_node.next_leaf_page = node.next_leaf_page;
+        node.next_leaf_page = right_page;
+
+        if (!write_node(tree, page_id, &node, error_buf, error_buf_size) ||
+            !write_node(tree, right_page, &right_node, error_buf, error_buf_size)) {
+            *duplicate_key = -1;
+            return result;
+        }
+
+        result.has_split = 1;
+        result.promoted_key = right_node.keys[0];
+        result.right_page = right_page;
+        return result;
+    }
+
+    index = find_child_index(&node, key);
+    {
+        InsertResult child_result = insert_recursive(tree,
+                                                     node.children[index],
+                                                     key,
+                                                     value,
+                                                     duplicate_key,
+                                                     error_buf,
+                                                     error_buf_size);
+        if (*duplicate_key != 0 || !child_result.has_split) {
+            return child_result.has_split ? child_result : result;
+        }
+
+        for (size_t shift = (size_t)node.key_count; shift > index; --shift) {
+            node.keys[shift] = node.keys[shift - 1];
+        }
+        for (size_t shift = (size_t)node.key_count + 1; shift > index + 1; --shift) {
+            node.children[shift] = node.children[shift - 1];
+        }
+
+        node.keys[index] = child_result.promoted_key;
+        node.children[index + 1] = child_result.right_page;
+        ++node.key_count;
+    }
+
+    if (node.key_count <= BPTREE_MAX_KEYS) {
+        if (!write_node(tree, page_id, &node, error_buf, error_buf_size)) {
+            *duplicate_key = -1;
+        }
+        return result;
+    }
+
+    {
+        DiskBPlusTreeNode right_node;
+        int64_t right_page;
+        size_t split_index;
+        size_t right_key_count;
+
+        memset(&right_node, 0, sizeof(right_node));
+        right_node.is_leaf = 0;
+
+        split_index = (size_t)node.key_count / 2;
+        result.promoted_key = node.keys[split_index];
+        right_key_count = (size_t)node.key_count - split_index - 1;
+        for (index = 0; index < right_key_count; ++index) {
+            right_node.keys[index] = node.keys[split_index + 1 + index];
+        }
+        for (index = 0; index <= right_key_count; ++index) {
+            right_node.children[index] = node.children[split_index + 1 + index];
+        }
+
+        right_node.key_count = (int32_t)right_key_count;
+        node.key_count = (int32_t)split_index;
+
+        right_page = allocate_page(tree, error_buf, error_buf_size);
+        if (right_page == 0) {
+            *duplicate_key = -1;
+            result.has_split = 0;
+            return result;
+        }
+
+        if (!write_node(tree, page_id, &node, error_buf, error_buf_size) ||
+            !write_node(tree, right_page, &right_node, error_buf, error_buf_size)) {
+            *duplicate_key = -1;
+            result.has_split = 0;
+            return result;
+        }
+
+        result.has_split = 1;
+        result.right_page = right_page;
+        return result;
+    }
+}
+
+static size_t lower_bound_in_leaf(const DiskBPlusTreeNode *leaf, int key) {
+    size_t index = 0;
+
+    while (index < (size_t)leaf->key_count && leaf->keys[index] < key) {
+        ++index;
+    }
+
+    return index;
+}
+
+static size_t upper_bound_in_leaf(const DiskBPlusTreeNode *leaf, int key) {
+    size_t index = 0;
+
+    while (index < (size_t)leaf->key_count && leaf->keys[index] <= key) {
+        ++index;
+    }
+
+    return index;
+}
+
+static int visit_from_leaf(BPlusTree *tree,
+                           int64_t page_id,
+                           size_t start_index,
+                           BPlusTreeVisitFn visit,
+                           void *context,
+                           char *error_buf,
+                           size_t error_buf_size) {
+    DiskBPlusTreeNode leaf;
+    size_t index;
+
+    while (page_id != 0) {
+        if (!read_node(tree, page_id, &leaf, error_buf, error_buf_size)) {
             return 0;
         }
 
-        new_root->keys[0] = result.promoted_key;
-        new_root->children[0] = tree->root;
-        new_root->children[1] = result.right_node;
-        new_root->key_count = 1;
-        tree->root = new_root;
+        for (index = start_index; index < (size_t)leaf.key_count; ++index) {
+            if (!visit(leaf.keys[index], (long)leaf.values[index], context)) {
+                return 0;
+            }
+        }
+
+        page_id = leaf.next_leaf_page;
+        start_index = 0;
     }
 
     return 1;
 }
 
-/*
- * key를 따라가며 leaf에서 row offset을 찾는다.
- *
- * 반환:
- * - 성공: 1, offset 출력
- * - 실패: 0
- */
-int bptree_search(const BPTree *tree, int key, long *offset) {
-    BPTreeNode *node; /* 현재 탐색 중인 노드 */
-    int i;            /* leaf 안에서 key 비교용 인덱스 */
+void bptree_init(BPlusTree *tree) {
+    if (tree == NULL) {
+        return;
+    }
 
-    if (tree == NULL || tree->root == NULL) {
+    memset(tree, 0, sizeof(*tree));
+    tree->next_id = 1;
+}
+
+void bptree_destroy(BPlusTree *tree) {
+    if (tree == NULL) {
+        return;
+    }
+
+    if (tree->file != NULL) {
+        fclose(tree->file);
+    }
+
+    bptree_init(tree);
+}
+
+int bptree_open(BPlusTree *tree, const char *path, char *error_buf, size_t error_buf_size) {
+    FILE *file = fopen(path, "r+b");
+    int new_file = 0;
+    long file_size = 0;
+
+    if (error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+    bptree_destroy(tree);
+
+    if (file == NULL) {
+        file = fopen(path, "w+b");
+        if (file == NULL) {
+            snprintf(error_buf, error_buf_size, "인덱스 파일을 열 수 없습니다: %s", path);
+            return 0;
+        }
+        new_file = 1;
+    }
+
+    tree->file = file;
+    setvbuf(tree->file, NULL, _IOFBF, 1 << 20);
+    if (fseek(tree->file, 0, SEEK_END) != 0) {
+        bptree_destroy(tree);
+        return set_error(error_buf, error_buf_size, "인덱스 파일 크기를 확인하는 데 실패했습니다.");
+    }
+    file_size = ftell(tree->file);
+    if (file_size < 0) {
+        bptree_destroy(tree);
+        return set_error(error_buf, error_buf_size, "인덱스 파일 크기를 읽는 데 실패했습니다.");
+    }
+    if (file_size == 0) {
+        new_file = 1;
+    }
+
+    if (new_file) {
+        tree->root_page = 0;
+        tree->first_leaf_page = 0;
+        tree->page_count = 0;
+        tree->key_count = 0;
+        tree->next_id = 1;
+        if (!write_header(tree, error_buf, error_buf_size)) {
+            bptree_destroy(tree);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (!read_header(tree, error_buf, error_buf_size)) {
+        bptree_destroy(tree);
         return 0;
     }
 
-    node = tree->root;
-    while (!node->is_leaf) {
-        int child_index = find_child_index(node, key); /* 다음에 내려갈 child 위치 */
-        node = node->children[child_index];
-        if (node == NULL) {
-            return 0;
-        }
+    return 1;
+}
+
+size_t bptree_size(const BPlusTree *tree) {
+    return tree == NULL ? 0 : (size_t)tree->key_count;
+}
+
+int bptree_next_id(const BPlusTree *tree) {
+    return tree == NULL ? 1 : tree->next_id;
+}
+
+int bptree_insert(BPlusTree *tree, int key, long value, char *error_buf, size_t error_buf_size) {
+    int duplicate_key = 0;
+    InsertResult result;
+
+    if (error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+    if (tree == NULL || tree->file == NULL) {
+        return set_error(error_buf, error_buf_size, "인덱스 파일이 열려 있지 않습니다.");
     }
 
-    for (i = 0; i < node->key_count; i++) {
-        if (node->keys[i] == key) {
-            if (offset != NULL) {
-                *offset = node->offsets[i];
+    if (tree->root_page == 0) {
+        DiskBPlusTreeNode root_node;
+        int64_t root_page = allocate_page(tree, error_buf, error_buf_size);
+
+        if (root_page == 0) {
+            return 0;
+        }
+
+        memset(&root_node, 0, sizeof(root_node));
+        root_node.is_leaf = 1;
+        root_node.key_count = 1;
+        root_node.keys[0] = key;
+        root_node.values[0] = value;
+
+        tree->root_page = root_page;
+        tree->first_leaf_page = root_page;
+        tree->key_count = 1;
+        if (key >= tree->next_id) {
+            tree->next_id = key + 1;
+        }
+
+        if (!write_node(tree, root_page, &root_node, error_buf, error_buf_size) ||
+            !write_header(tree, error_buf, error_buf_size)) {
+            return 0;
+        }
+
+        return 1;
+    }
+
+    result = insert_recursive(tree, tree->root_page, key, value, &duplicate_key, error_buf, error_buf_size);
+    if (duplicate_key == 1) {
+        snprintf(error_buf, error_buf_size, "중복된 id 키입니다: %d", key);
+        return 0;
+    }
+    if (duplicate_key == -1) {
+        return 0;
+    }
+
+    if (result.has_split) {
+        DiskBPlusTreeNode new_root;
+        int64_t new_root_page = allocate_page(tree, error_buf, error_buf_size);
+
+        if (new_root_page == 0) {
+            return 0;
+        }
+
+        memset(&new_root, 0, sizeof(new_root));
+        new_root.is_leaf = 0;
+        new_root.key_count = 1;
+        new_root.keys[0] = result.promoted_key;
+        new_root.children[0] = tree->root_page;
+        new_root.children[1] = result.right_page;
+
+        if (!write_node(tree, new_root_page, &new_root, error_buf, error_buf_size)) {
+            return 0;
+        }
+        tree->root_page = new_root_page;
+    }
+
+    ++tree->key_count;
+    if (key >= tree->next_id) {
+        tree->next_id = key + 1;
+    }
+
+    return write_header(tree, error_buf, error_buf_size);
+}
+
+int bptree_search(BPlusTree *tree, int key, long *out_value, char *error_buf, size_t error_buf_size) {
+    int64_t leaf_page;
+    DiskBPlusTreeNode leaf;
+    size_t index;
+
+    if (error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+    if (tree == NULL || tree->file == NULL || tree->root_page == 0) {
+        return 0;
+    }
+
+    leaf_page = find_leaf_page(tree, key, error_buf, error_buf_size);
+    if (leaf_page <= 0) {
+        return 0;
+    }
+    if (!read_node(tree, leaf_page, &leaf, error_buf, error_buf_size)) {
+        return 0;
+    }
+
+    for (index = 0; index < (size_t)leaf.key_count; ++index) {
+        if (leaf.keys[index] == key) {
+            if (out_value != NULL) {
+                *out_value = (long)leaf.values[index];
             }
             return 1;
         }
@@ -343,76 +650,86 @@ int bptree_search(const BPTree *tree, int key, long *offset) {
     return 0;
 }
 
-/*
- * 주어진 key 이상이 처음 나타나는 leaf와 leaf 내부 인덱스를 찾는다.
- *
- * 이 함수는 범위 스캔의 시작점을 찾기 위한 lower bound 역할을 한다.
- * 예를 들어 keys가 [1, 3, 7, 10]이고 key가 5이면,
- * 7이 들어 있는 leaf와 그 인덱스를 반환한다.
- *
- * 반환:
- * - 1: 시작 leaf/index를 찾음
- * - 0: tree가 비었거나 key 이상인 값이 없음
- */
-int bptree_find_lower_bound(const BPTree *tree, int key, BPTreeNode **leaf, int *index) {
-    BPTreeNode *node; /* 현재 내려가고 있는 노드 */
-    int i;            /* leaf 내부에서 lower bound를 찾는 인덱스 */
+int bptree_visit(BPlusTree *tree,
+                 CompareOperator op,
+                 int key,
+                 BPlusTreeVisitFn visit,
+                 void *context,
+                 char *error_buf,
+                 size_t error_buf_size) {
+    DiskBPlusTreeNode leaf;
+    DiskBPlusTreeNode current_leaf;
+    int64_t leaf_page;
+    int64_t current_page;
+    long value;
+    size_t index;
 
-    if (leaf != NULL) {
-        *leaf = NULL;
+    if (error_buf_size > 0) {
+        error_buf[0] = '\0';
     }
-    if (index != NULL) {
-        *index = 0;
-    }
-
-    if (tree == NULL || tree->root == NULL) {
-        return 0;
+    if (tree == NULL || tree->file == NULL || visit == NULL || tree->root_page == 0) {
+        return 1;
     }
 
-    node = tree->root;
-    while (!node->is_leaf) {
-        int child_index = find_child_index(node, key); /* key가 들어갈 child 위치 */
-        node = node->children[child_index];
-        if (node == NULL) {
-            return 0;
-        }
-    }
-
-    while (node != NULL) {
-        for (i = 0; i < node->key_count; i++) {
-            if (node->keys[i] >= key) {
-                if (leaf != NULL) {
-                    *leaf = node;
-                }
-                if (index != NULL) {
-                    *index = i;
-                }
-                return 1;
+    switch (op) {
+        case COMPARE_EQUALS:
+            if (!bptree_search(tree, key, &value, error_buf, error_buf_size)) {
+                return error_buf[0] == '\0' ? 1 : 0;
             }
-        }
-        node = node->next;
+            return visit(key, value, context);
+        case COMPARE_GREATER_THAN:
+        case COMPARE_GREATER_THAN_OR_EQUAL:
+            leaf_page = find_leaf_page(tree, key, error_buf, error_buf_size);
+            if (leaf_page <= 0) {
+                return leaf_page == 0 ? 1 : 0;
+            }
+            if (!read_node(tree, leaf_page, &leaf, error_buf, error_buf_size)) {
+                return 0;
+            }
+            return visit_from_leaf(tree,
+                                   leaf_page,
+                                   op == COMPARE_GREATER_THAN ? upper_bound_in_leaf(&leaf, key) : lower_bound_in_leaf(&leaf, key),
+                                   visit,
+                                   context,
+                                   error_buf,
+                                   error_buf_size);
+        case COMPARE_LESS_THAN:
+        case COMPARE_LESS_THAN_OR_EQUAL:
+            current_page = tree->first_leaf_page;
+            while (current_page != 0) {
+                if (!read_node(tree, current_page, &current_leaf, error_buf, error_buf_size)) {
+                    return 0;
+                }
+                for (index = 0; index < (size_t)current_leaf.key_count; ++index) {
+                    if ((op == COMPARE_LESS_THAN && current_leaf.keys[index] >= key) ||
+                        (op == COMPARE_LESS_THAN_OR_EQUAL && current_leaf.keys[index] > key)) {
+                        return 1;
+                    }
+                    if (!visit(current_leaf.keys[index], (long)current_leaf.values[index], context)) {
+                        return 0;
+                    }
+                }
+                current_page = current_leaf.next_leaf_page;
+            }
+            return 1;
+        case COMPARE_NOT_EQUALS:
+            current_page = tree->first_leaf_page;
+            while (current_page != 0) {
+                if (!read_node(tree, current_page, &current_leaf, error_buf, error_buf_size)) {
+                    return 0;
+                }
+                for (index = 0; index < (size_t)current_leaf.key_count; ++index) {
+                    if (current_leaf.keys[index] == key) {
+                        continue;
+                    }
+                    if (!visit(current_leaf.keys[index], (long)current_leaf.values[index], context)) {
+                        return 0;
+                    }
+                }
+                current_page = current_leaf.next_leaf_page;
+            }
+            return 1;
     }
 
-    return 0;
-}
-
-/*
- * B+ 트리에서 가장 왼쪽 leaf를 반환한다.
- *
- * '<', '<='처럼 작은 값부터 순서대로 읽어야 하는 범위 조건에서
- * leaf 순회를 시작할 때 사용한다.
- */
-BPTreeNode *bptree_leftmost_leaf(const BPTree *tree) {
-    BPTreeNode *node; /* 가장 왼쪽 leaf를 찾기 위해 내려가는 포인터 */
-
-    if (tree == NULL || tree->root == NULL) {
-        return NULL;
-    }
-
-    node = tree->root;
-    while (node != NULL && !node->is_leaf) {
-        node = node->children[0];
-    }
-
-    return node;
+    return 1;
 }

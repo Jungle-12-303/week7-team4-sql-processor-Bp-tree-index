@@ -1,2 +1,0 @@
-SELECT * FROM users WHERE id=50000
-SELECT * FROM users WHERE age=50
